@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="initial-scale=1,user-scalable=no,maximum-scale=1">
+  <title>Vector Addition</title>
+  <!-- Original AoPS interactive. Replaces the third-party "Vector Addition" simulation. -->
+<script>
+// EigenNode auto-height v2.4
+(function() {
+  // 4px buffer for subpixel rounding + parent's >=3px noise threshold.
+  // Extra 18px when horizontal overflow forces a scrollbar (eats vertical
+  // space inside the iframe — AoPS classroom embeds in a narrower column
+  // than the 600px content, so a horizontal scrollbar appears and steals
+  // ~10-17px of height). Without this, the iframe ends up ~11-15px short.
+  var BUFFER = 4;
+  var H_SCROLLBAR = 18;
+  var measuring = false;
+  function measure() {
+    if (measuring) return 0;
+    var b = document.body, h = document.documentElement;
+    if (!b) return 0;
+    measuring = true;
+    // Temporarily neutralise body's height/min-height (overriding stylesheet
+    // rules with !important) so scrollHeight reflects actual content extent.
+    // Without this, patterns like body { height: 100vh } cause scrollHeight
+    // to echo the iframe's current viewport — adding BUFFER each cycle
+    // ratchets the iframe taller forever. Browser doesn't paint until this
+    // synchronous block returns, so no visible flicker.
+    var hOld = b.style.height, hPri = b.style.getPropertyPriority('height');
+    var mOld = b.style.minHeight, mPri = b.style.getPropertyPriority('min-height');
+    b.style.setProperty('height', 'auto', 'important');
+    b.style.setProperty('min-height', '0', 'important');
+    var content = b.scrollHeight || 0;
+    if (hOld) b.style.setProperty('height', hOld, hPri); else b.style.removeProperty('height');
+    if (mOld) b.style.setProperty('min-height', mOld, mPri); else b.style.removeProperty('min-height');
+    measuring = false;
+    // Check the documentElement only — that's the element that owns the
+    // iframe's horizontal scrollbar. Body can be narrower than the iframe
+    // (e.g. body{width:600px} centered in a 700px iframe) and have its own
+    // 1-2px overflow that doesn't actually trigger a scrollbar.
+    var hOverflow = h && (h.scrollWidth - h.clientWidth) >= 4;
+    return Math.ceil(content) + BUFFER + (hOverflow ? H_SCROLLBAR : 0);
+  }
+  var last = 0;
+  function report() {
+    var h = measure();
+    if (h > 0 && Math.abs(h - last) >= 2) {
+      last = h;
+      window.parent.postMessage({ type: 'resize', height: h }, '*');
+    }
+  }
+  window.addEventListener('load', report);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(report);
+  if (window.ResizeObserver && document.body) new ResizeObserver(report).observe(document.body);
+})();
+</script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 800px; height: 600px; overflow: hidden;
+      background: #f4f6fa;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="800" height="600"></canvas>
+  <script>
+  (() => {
+    'use strict';
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const W = 800, H = 600;
+    const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // ── Layout ───────────────────────────────────────────────
+    const BAR = { x: 16, y: 8,  w: 576, h: 42 };   // readout bar
+    const GP  = { x: 16, y: 58, w: 576, h: 480 };  // grid panel
+    const CELL = 12, GX = 24, GY = 20;             // px/unit, half-extents
+    const OX = GP.x + GP.w / 2, OY = GP.y + GP.h / 2;
+    const PX = 604, PW = 188;                      // right control column
+    const trayBox = { x: PX, y: 388, w: PW, h: 146 };
+
+    // ── Colors ───────────────────────────────────────────────
+    const COL = {
+      bg: '#f4f6fa', panel: '#ffffff', border: '#d6deea',
+      gridMinor: '#e9eef6', gridMajor: '#ccd8e6', axis: '#3a4554',
+      text: '#2b3645', muted: '#8d9bac', accent: '#3565c0',
+      sum: '#e8650d'
+    };
+    const VDEF = [
+      { id: 'a', color: '#1d4ed8', def: { x: 4, y: 3 } },   // royal blue
+      { id: 'b', color: '#0ea5e9', def: { x: 3, y: 4 } },   // sky blue
+      { id: 'c', color: '#5b6abf', def: { x: 4, y: -3 } }   // slate blue
+    ];
+
+    // ── State ────────────────────────────────────────────────
+    const S = {};   // settings: sum, values, angles, grid, comps, deg360, polar
+    const vectors = VDEF.map(d => ({
+      id: d.id, color: d.color, def: { ...d.def },
+      tail: { x: 0, y: 0 }, c: { ...d.def }, placed: false
+    }));
+    let selected = null;        // 'a' | 'b' | 'c' | 's' | null
+    let drag = null;            // { kind:'tip'|'move'|'new', v, off }
+    let anim = null;            // tip-to-tail animation
+    let mouse = { x: -99, y: -99 };
+    let hoverW = null;
+
+    // ── Math helpers ─────────────────────────────────────────
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const R2D = 180 / Math.PI, D2R = Math.PI / 180;
+    const sx = wx => OX + wx * CELL;
+    const sy = wy => OY - wy * CELL;
+    const toWorld = p => ({ x: (p.x - OX) / CELL, y: (OY - p.y) / CELL });
+    const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+    const magOf = v => Math.hypot(v.c.x, v.c.y);
+
+    function angleDeg(cx, cy) {          // convention-adjusted angle in degrees
+      let a = Math.atan2(cy, cx) * R2D;  // (-180, 180]
+      if (S.deg360 && a < 0) a += 360;   // [0, 360)
+      return a;
+    }
+    function fmt1(v) {                   // fixed 1-decimal, no "-0.0"
+      let r = Math.round(v * 10) / 10;
+      if (Object.is(r, -0)) r = 0;
+      return r.toFixed(1);
+    }
+    function fmtS(v) {                   // short: integers without ".0"
+      let r = Math.round(v * 10) / 10;
+      if (Object.is(r, -0)) r = 0;
+      return Number.isInteger(r) ? String(r) : r.toFixed(1);
+    }
+
+    // Integer-snapped tail keeping tail AND tip inside the grid
+    function clampTail(t, c) {
+      const lox = Math.ceil(-GX - Math.min(0, c.x) - 1e-9);
+      const hix = Math.floor(GX - Math.max(0, c.x) + 1e-9);
+      const loy = Math.ceil(-GY - Math.min(0, c.y) - 1e-9);
+      const hiy = Math.floor(GY - Math.max(0, c.y) + 1e-9);
+      return { x: clamp(Math.round(t.x), lox, hix), y: clamp(Math.round(t.y), loy, hiy) };
+    }
+    // Float version (used by URL-param tails and tip-to-tail chains)
+    function clampTailF(t, c) {
+      return {
+        x: clamp(t.x, -GX - Math.min(0, c.x), GX - Math.max(0, c.x)),
+        y: clamp(t.y, -GY - Math.min(0, c.y), GY - Math.max(0, c.y))
+      };
+    }
+
+    function snapTip(v, w) {
+      if (S.polar) {
+        const dx = w.x - v.tail.x, dy = w.y - v.tail.y;
+        const r = Math.hypot(dx, dy);
+        if (r < 0.3) return;
+        let rs = Math.max(0.5, Math.round(r * 2) / 2);          // |v| snaps to 0.5
+        const as = Math.round(Math.atan2(dy, dx) * R2D / 5) * 5 * D2R; // θ snaps to 5°
+        const mk = () => ({ x: rs * Math.cos(as), y: rs * Math.sin(as) });
+        let c = mk();
+        while (rs > 0.5 && (Math.abs(v.tail.x + c.x) > GX || Math.abs(v.tail.y + c.y) > GY)) {
+          rs -= 0.5; c = mk();
+        }
+        if (Math.abs(v.tail.x + c.x) > GX + 1e-9 || Math.abs(v.tail.y + c.y) > GY + 1e-9) return;
+        v.c = { x: Math.round(c.x * 1e6) / 1e6, y: Math.round(c.y * 1e6) / 1e6 };
+      } else {
+        const tx = clamp(Math.round(w.x), -GX, GX);             // integer components
+        const ty = clamp(Math.round(w.y), -GY, GY);
+        const c = { x: tx - v.tail.x, y: ty - v.tail.y };
+        if (c.x === 0 && c.y === 0) return;                     // never zero-length
+        v.c = c;
+      }
+    }
+
+    function placedVecs() { return vectors.filter(v => v.placed); }
+    function sumC() {
+      const s = { x: 0, y: 0 };
+      for (const v of placedVecs()) { s.x += v.c.x; s.y += v.c.y; }
+      return s;
+    }
+    function sumVisible() { return S.sum && placedVecs().length > 0; }
+
+    // ── Tip-to-tail arrangement ──────────────────────────────
+    function arrangeTipToTail() {
+      const order = placedVecs();
+      if (order.length < 2 || anim) return;
+      let cur = { ...order[0].tail };
+      const targets = [];
+      let minX = cur.x, maxX = cur.x, minY = cur.y, maxY = cur.y;
+      for (const v of order) {
+        targets.push({ v, to: { x: cur.x, y: cur.y } });
+        cur = { x: cur.x + v.c.x, y: cur.y + v.c.y };
+        minX = Math.min(minX, cur.x); maxX = Math.max(maxX, cur.x);
+        minY = Math.min(minY, cur.y); maxY = Math.max(maxY, cur.y);
+      }
+      let dx = 0, dy = 0;                       // shift chain into bounds if needed
+      if (minX < -GX) dx = -GX - minX;
+      if (maxX + dx > GX) dx = GX - maxX;
+      if (minY < -GY) dy = -GY - minY;
+      if (maxY + dy > GY) dy = GY - maxY;
+      const items = targets.map(t => ({
+        v: t.v, from: { ...t.v.tail },
+        to: clampTailF({ x: t.to.x + dx, y: t.to.y + dy }, t.v.c)
+      }));
+      anim = { t: 0, dur: 0.7, items };
+    }
+    function finishAnim() {
+      if (!anim) return;
+      for (const it of anim.items) it.v.tail = { ...it.to };
+      anim = null;
+    }
+
+    function eraseAll() {
+      finishAnim();
+      for (const v of vectors) v.placed = false;
+      selected = null; drag = null;
+    }
+
+    // ── URL params / init ────────────────────────────────────
+    function parseVecStr(s, allowZero) {
+      if (!s) return null;
+      s = s.trim();
+      if (s.includes('@')) {                    // polar form "r@deg"
+        const parts = s.split('@');
+        const r = parseFloat(parts[0]), a = parseFloat(parts[1]);
+        if (!isFinite(r) || !isFinite(a) || r <= 0) return null;
+        return { x: r * Math.cos(a * D2R), y: r * Math.sin(a * D2R) };
+      }
+      const m = s.split(',');
+      if (m.length !== 2) return null;
+      const x = parseFloat(m[0]), y = parseFloat(m[1]);
+      if (!isFinite(x) || !isFinite(y)) return null;
+      if (!allowZero && x === 0 && y === 0) return null;
+      return { x, y };
+    }
+
+    function init() {
+      Object.assign(S, {
+        sum: false, values: true, angles: false, grid: true,
+        comps: 'axes', deg360: false, polar: false
+      });
+      selected = null; drag = null; anim = null;
+      const q = new URLSearchParams(location.search);
+      const flag = (k, dflt) => {
+        const v = q.get(k);
+        return v === null ? dflt : (v !== '0' && v !== 'false' && v !== 'off');
+      };
+      S.sum    = flag('sum', false);
+      S.values = flag('values', true);
+      S.angles = flag('angle', flag('angles', false));
+      S.grid   = flag('grid', true);
+      const cm = (q.get('components') || 'axes').toLowerCase();
+      S.comps = /^(none|off|0)$/.test(cm) ? 'none' : /^tri/.test(cm) ? 'triangle' : 'axes';
+      S.deg360 = q.get('deg') === '360';
+      S.polar  = (q.get('snap') || '').toLowerCase() === 'polar';
+      for (const v of vectors) {
+        v.placed = false; v.c = { ...v.def }; v.tail = { x: 0, y: 0 };
+        const pc = parseVecStr(q.get(v.id), false);
+        if (pc) {
+          v.c = { x: clamp(pc.x, -2 * GX, 2 * GX), y: clamp(pc.y, -2 * GY, 2 * GY) };
+          const pt = parseVecStr(q.get(v.id + 'tail'), true) || { x: 0, y: 0 };
+          v.tail = clampTailF(pt, v.c);
+          v.placed = true;
+        }
+      }
+      const sel = q.get('select');
+      if (sel === 's') { if (sumVisible()) selected = 's'; }
+      else if (sel && vectors.some(v => v.id === sel && v.placed)) selected = sel;
+    }
+
+    // ── Drawing primitives ───────────────────────────────────
+    function rr(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+    function panelBox(x, y, w, h) {
+      rr(x, y, w, h, 8);
+      ctx.fillStyle = COL.panel; ctx.fill();
+      ctx.strokeStyle = COL.border; ctx.lineWidth = 1; ctx.stroke();
+    }
+    function arrow(x1, y1, x2, y2, o) {
+      const dx = x2 - x1, dy = y2 - y1, L = Math.hypot(dx, dy);
+      if (L < 1) return;
+      const ux = dx / L, uy = dy / L;
+      const hl = Math.min(o.headL || 12, L * 0.55), hw = o.headW || 8.5;
+      ctx.save();
+      if (o.alpha !== undefined) ctx.globalAlpha = o.alpha;
+      ctx.strokeStyle = o.color; ctx.fillStyle = o.color;
+      ctx.lineWidth = o.lw || 4; ctx.lineCap = 'round';
+      if (o.dash) ctx.setLineDash(o.dash);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2 - ux * hl * 0.85, y2 - uy * hl * 0.85);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - ux * hl - uy * hw / 2, y2 - uy * hl + ux * hw / 2);
+      ctx.lineTo(x2 - ux * hl + uy * hw / 2, y2 - uy * hl - ux * hw / 2);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    // Italic letter with a small vector arrow drawn above; returns width used
+    function vecLetter(letter, x, y, size, color) {
+      ctx.fillStyle = color; ctx.strokeStyle = color;
+      ctx.font = 'italic ' + size + 'px Georgia, serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      const w = ctx.measureText(letter).width;
+      ctx.fillText(letter, x, y);
+      const ay = y - size * 0.88;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath(); ctx.moveTo(x + 0.5, ay); ctx.lineTo(x + w + 1.5, ay); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x + w + 4, ay);
+      ctx.lineTo(x + w, ay - 2.5);
+      ctx.lineTo(x + w, ay + 2.5);
+      ctx.closePath(); ctx.fill();
+      return w + 4;
+    }
+
+    // ── Grid ─────────────────────────────────────────────────
+    function drawGridLines() {
+      if (S.grid) {
+        ctx.lineWidth = 1;
+        for (let i = -GX; i <= GX; i++) {
+          ctx.strokeStyle = (i % 5 === 0) ? COL.gridMajor : COL.gridMinor;
+          ctx.beginPath(); ctx.moveTo(sx(i), GP.y); ctx.lineTo(sx(i), GP.y + GP.h); ctx.stroke();
+        }
+        for (let j = -GY; j <= GY; j++) {
+          ctx.strokeStyle = (j % 5 === 0) ? COL.gridMajor : COL.gridMinor;
+          ctx.beginPath(); ctx.moveTo(GP.x, sy(j)); ctx.lineTo(GP.x + GP.w, sy(j)); ctx.stroke();
+        }
+      }
+      // Axes (always shown)
+      ctx.strokeStyle = COL.axis; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(GP.x + 3, OY); ctx.lineTo(GP.x + GP.w - 10, OY); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(OX, GP.y + GP.h - 3); ctx.lineTo(OX, GP.y + 10); ctx.stroke();
+      ctx.fillStyle = COL.axis;
+      ctx.beginPath();
+      ctx.moveTo(GP.x + GP.w - 3, OY); ctx.lineTo(GP.x + GP.w - 11, OY - 4.5);
+      ctx.lineTo(GP.x + GP.w - 11, OY + 4.5); ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(OX, GP.y + 3); ctx.lineTo(OX - 4.5, GP.y + 11);
+      ctx.lineTo(OX + 4.5, GP.y + 11); ctx.closePath(); ctx.fill();
+      ctx.font = 'italic 13px Georgia, serif';
+      ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+      ctx.fillText('x', GP.x + GP.w - 14, OY - 8);
+      ctx.fillText('y', OX + 9, GP.y + 16);
+      // Ticks + numbers every 5 units
+      ctx.font = '10px Segoe UI, system-ui, sans-serif';
+      for (let i = -20; i <= 20; i += 5) {
+        if (i === 0) continue;
+        ctx.strokeStyle = COL.axis; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(sx(i), OY - 4); ctx.lineTo(sx(i), OY + 4); ctx.stroke();
+        ctx.fillStyle = COL.muted; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.fillText(String(i), sx(i), OY + 7);
+      }
+      for (let j = -20; j <= 20; j += 5) {
+        if (j === 0 || Math.abs(j) === 20) continue;
+        ctx.strokeStyle = COL.axis; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(OX - 4, sy(j)); ctx.lineTo(OX + 4, sy(j)); ctx.stroke();
+        ctx.fillStyle = COL.muted; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(j), OX - 8, sy(j));
+      }
+      ctx.beginPath(); ctx.arc(OX, OY, 3, 0, 2 * Math.PI);
+      ctx.fillStyle = '#94a3b3'; ctx.fill();
+    }
+
+    // ── Vector rendering ─────────────────────────────────────
+    function drawComponents(v, color) {
+      const t = v.tail, c = v.c;
+      const x1 = sx(t.x), y1 = sy(t.y), x2 = sx(t.x + c.x), y2 = sy(t.y + c.y);
+      const dash = [7, 5], lw = 3, al = 0.7;
+      if (S.comps === 'triangle') {
+        // dashed legs at the vector itself (x leg first, then y leg)
+        if (Math.abs(c.x) > 0.01) arrow(x1, y1, x2, y1, { color, lw, dash, alpha: al, headL: 10, headW: 8 });
+        if (Math.abs(c.y) > 0.01) arrow(x2, y1, x2, y2, { color, lw, dash, alpha: al, headL: 10, headW: 8 });
+      } else if (S.comps === 'axes') {
+        // dashed projections drawn on the x and y axes
+        if (Math.abs(c.x) > 0.01) arrow(sx(t.x), sy(0), sx(t.x + c.x), sy(0), { color, lw, dash, alpha: al, headL: 10, headW: 8 });
+        if (Math.abs(c.y) > 0.01) arrow(sx(0), sy(t.y), sx(0), sy(t.y + c.y), { color, lw, dash, alpha: al, headL: 10, headW: 8 });
+        // faint guide lines from the tip to its two projections
+        ctx.save();
+        ctx.strokeStyle = color; ctx.globalAlpha = 0.3;
+        ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x2, y2); ctx.lineTo(x2, sy(0));
+        ctx.moveTo(x2, y2); ctx.lineTo(sx(0), y2);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    function drawAngle(v, color) {
+      const c = v.c, L = Math.hypot(c.x, c.y);
+      if (L < 1e-6) return;
+      const th = angleDeg(c.x, c.y);
+      if (Math.abs(th) < 0.05) return;
+      const x0 = sx(v.tail.x), y0 = sy(v.tail.y);
+      const rad = Math.min(26, L * CELL * 0.45);
+      ctx.save();
+      ctx.strokeStyle = '#9aa7b6'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + rad + 14, y0); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.arc(x0, y0, rad, 0, -th * D2R, th > 0); ctx.stroke();
+      ctx.restore();
+      if (S.values) {
+        const mid = th / 2 * D2R;
+        const lx = x0 + (rad + 14) * Math.cos(mid), ly = y0 - (rad + 14) * Math.sin(mid);
+        ctx.fillStyle = COL.text; ctx.font = '11px Segoe UI, system-ui, sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(fmtS(th) + '°', lx, ly);
+      }
+    }
+
+    function tagSuffix(v) {
+      if (!S.values) return null;
+      if (S.polar) {
+        const m = magOf(v), th = angleDeg(v.c.x, v.c.y);
+        return fmt1(m) + ' ∠ ' + fmtS(th) + '°';
+      }
+      return '⟨' + fmtS(v.c.x) + ', ' + fmtS(v.c.y) + '⟩';
+    }
+
+    function drawTag(v) {
+      const x1 = sx(v.tail.x), y1 = sy(v.tail.y);
+      const x2 = sx(v.tail.x + v.c.x), y2 = sy(v.tail.y + v.c.y);
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      let nx = -(y2 - y1), ny = x2 - x1;
+      const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+      if (ny > 0) { nx = -nx; ny = -ny; }       // prefer placing the tag above
+      const suffix = tagSuffix(v);
+      ctx.font = 'italic 13px Georgia, serif';
+      const lw = ctx.measureText(v.id).width + 5;
+      ctx.font = '12px Segoe UI, system-ui, sans-serif';
+      const sw = suffix ? ctx.measureText(suffix).width + 5 : 0;
+      const tw = lw + sw + 12, th = 20;
+      let cx = clamp(mx + nx * 17, GP.x + tw / 2 + 2, GP.x + GP.w - tw / 2 - 2);
+      let cy = clamp(my + ny * 17, GP.y + th / 2 + 2, GP.y + GP.h - th / 2 - 2);
+      rr(cx - tw / 2, cy - th / 2, tw, th, 5);
+      ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.fill();
+      ctx.strokeStyle = v.color; ctx.lineWidth = 1.2; ctx.stroke();
+      let tx = cx - tw / 2 + 6;
+      tx += vecLetter(v.id, tx, cy + 5, 13, v.color) + 4;
+      if (suffix) {
+        ctx.fillStyle = COL.text; ctx.font = '12px Segoe UI, system-ui, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.fillText(suffix, tx, cy + 4);
+      }
+    }
+
+    function drawVector(v, isSel) {
+      const x1 = sx(v.tail.x), y1 = sy(v.tail.y);
+      const x2 = sx(v.tail.x + v.c.x), y2 = sy(v.tail.y + v.c.y);
+      ctx.save();
+      if (isSel) { ctx.shadowColor = v.color; ctx.shadowBlur = 9; }
+      arrow(x1, y1, x2, y2, { color: v.color, lw: isSel ? 5 : 4, headL: 13, headW: 10 });
+      ctx.restore();
+      if (isSel && !v.isSum) {
+        ctx.beginPath(); ctx.arc(x1, y1, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = v.color; ctx.fill();
+        ctx.beginPath(); ctx.arc(x2, y2, 7.5, 0, 2 * Math.PI);
+        ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fill();
+        ctx.strokeStyle = v.color; ctx.lineWidth = 2; ctx.stroke();
+      }
+      drawTag(v);
+    }
+
+    function drawZeroSum() {
+      const x0 = sx(0), y0 = sy(0);
+      ctx.save();
+      if (selected === 's') { ctx.shadowColor = COL.sum; ctx.shadowBlur = 8; }
+      ctx.beginPath(); ctx.arc(x0, y0, 8, 0, 2 * Math.PI);
+      ctx.strokeStyle = COL.sum; ctx.lineWidth = 3; ctx.stroke();
+      ctx.restore();
+      const tw = 54, th = 20, cx = x0 + 44, cy = y0 - 20;
+      rr(cx - tw / 2, cy - th / 2, tw, th, 5);
+      ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.fill();
+      ctx.strokeStyle = COL.sum; ctx.lineWidth = 1.2; ctx.stroke();
+      let tx = cx - tw / 2 + 8;
+      tx += vecLetter('s', tx, cy + 5, 13, COL.sum) + 4;
+      ctx.fillStyle = COL.text; ctx.font = '12px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('= 0', tx, cy + 4);
+    }
+
+    function sceneVectors() {
+      const list = placedVecs();
+      const sum = sumVisible()
+        ? { id: 's', color: COL.sum, tail: { x: 0, y: 0 }, c: sumC(), isSum: true }
+        : null;
+      if (S.comps !== 'none') {
+        for (const v of list) drawComponents(v, v.color);
+        if (sum && magOf(sum) > 0.005) drawComponents(sum, sum.color);
+      }
+      if (S.angles || S.polar) {
+        for (const v of list) drawAngle(v, v.color);
+        if (sum && magOf(sum) > 0.005) drawAngle(sum, sum.color);
+      }
+      if (sum) {
+        if (magOf(sum) > 0.005) drawVector(sum, selected === 's');
+        else drawZeroSum();
+      }
+      for (const v of list) if (v.id !== selected) drawVector(v, false);
+      const selV = vectors.find(v => v.id === selected && v.placed);
+      if (selV) drawVector(selV, true);
+    }
+
+    // ── Readout bar ──────────────────────────────────────────
+    function readoutVec() {
+      if (selected === 's' && sumVisible()) return { id: 's', color: COL.sum, c: sumC() };
+      const v = vectors.find(v => v.id === selected && v.placed);
+      return v ? { id: v.id, color: v.color, c: v.c } : null;
+    }
+    function drawBar() {
+      panelBox(BAR.x, BAR.y, BAR.w, BAR.h);
+      const rv = readoutVec();
+      const yMid = BAR.y + BAR.h / 2;
+      if (!rv) {
+        ctx.fillStyle = COL.muted;
+        ctx.font = 'italic 13px Segoe UI, system-ui, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText('Select a vector to see its magnitude, angle, and components.', BAR.x + 14, yMid);
+        return;
+      }
+      const m = Math.hypot(rv.c.x, rv.c.y);
+      const th = m < 1e-9 ? null : angleDeg(rv.c.x, rv.c.y);
+      let x = BAR.x + 10;
+      rr(x, BAR.y + 8, 30, 26, 6);
+      ctx.fillStyle = rv.color; ctx.fill();
+      ctx.font = 'italic 15px Georgia, serif';
+      const cw = ctx.measureText(rv.id).width;
+      vecLetter(rv.id, x + 15 - (cw + 4) / 2, BAR.y + 27, 15, '#ffffff');
+      x += 42;
+      const box = (val, unit) => {
+        rr(x, BAR.y + 8, 72, 26, 5);
+        ctx.fillStyle = '#fbfcfe'; ctx.fill();
+        ctx.strokeStyle = '#c8d2de'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.fillStyle = '#1c2733';
+        ctx.font = '600 14px Segoe UI, system-ui, sans-serif';
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(!S.values || val === null ? '—' : val + (unit || ''), x + 64, yMid + 0.5);
+        x += 72 + 16;
+      };
+      const sub = axis => {
+        ctx.font = 'italic 15px Georgia, serif'; ctx.fillStyle = COL.text;
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        const w = ctx.measureText(rv.id).width;
+        ctx.fillText(rv.id, x, yMid + 5);
+        ctx.font = 'italic 10px Georgia, serif';
+        ctx.fillText(axis, x + w + 1, yMid + 8);
+        x += w + 12;
+      };
+      // |v|
+      ctx.fillStyle = COL.text; ctx.font = '15px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      const bw = ctx.measureText('|').width;
+      ctx.fillText('|', x, yMid + 5); x += bw + 1;
+      x += vecLetter(rv.id, x, yMid + 5, 15, COL.text) + 1;
+      ctx.fillStyle = COL.text; ctx.font = '15px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('|', x, yMid + 5); x += bw + 7;
+      box(fmt1(m));
+      // θ
+      ctx.fillStyle = COL.text; ctx.font = 'italic 15px Georgia, serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('θ', x, yMid + 5); x += 14;
+      box(th === null ? null : fmt1(th), '°');
+      sub('x'); box(fmt1(rv.c.x));
+      sub('y'); box(fmt1(rv.c.y));
+    }
+
+    // ── Control widgets ──────────────────────────────────────
+    const widgets = [];
+    function addW(w) { widgets.push(w); return w; }
+
+    function addCheckbox(x, y, w, h, get, set, drawLabel) {
+      addW({
+        x, y, w, h, cursor: 'pointer',
+        onDown() { set(!get()); },
+        draw(hov) {
+          const bx = x, by = y + (h - 16) / 2;
+          rr(bx, by, 16, 16, 4);
+          ctx.fillStyle = get() ? COL.accent : '#ffffff'; ctx.fill();
+          ctx.strokeStyle = hov ? COL.accent : '#aebbcc';
+          ctx.lineWidth = 1.4; ctx.stroke();
+          if (get()) {
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.2;
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(bx + 3.5, by + 8.5); ctx.lineTo(bx + 6.5, by + 11.5);
+            ctx.lineTo(bx + 12.5, by + 4.5); ctx.stroke();
+          }
+          drawLabel(bx + 24, y + h / 2);
+        }
+      });
+    }
+    const textLabel = t => (lx, ly) => {
+      ctx.fillStyle = COL.text;
+      ctx.font = '13px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(t, lx, ly);
+    };
+    const sumLabel = (lx, ly) => {
+      textLabel('Sum')(lx, ly);
+      arrow(lx + 36, ly, lx + 58, ly, { color: COL.sum, lw: 3, headL: 8, headW: 7 });
+    };
+    const angleLabel = (lx, ly) => {
+      textLabel('Angle')(lx, ly);
+      ctx.font = 'italic 14px Georgia, serif';
+      ctx.fillText('θ', lx + 40, ly + 0.5);
+    };
+
+    const icNone = (ix, iy, col) => {
+      arrow(ix + 2, iy + 7, ix + 26, iy - 7, { color: col, lw: 2, headL: 7, headW: 6 });
+    };
+    const icTri = (ix, iy, col) => {
+      arrow(ix + 2, iy + 7, ix + 26, iy - 7, { color: col, lw: 2, headL: 7, headW: 6 });
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.2; ctx.setLineDash([3, 2]);
+      ctx.beginPath();
+      ctx.moveTo(ix + 2, iy + 7); ctx.lineTo(ix + 26, iy + 7); ctx.lineTo(ix + 26, iy - 7);
+      ctx.stroke();
+      ctx.restore();
+    };
+    const icAxes = (ix, iy, col) => {
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(ix, iy); ctx.lineTo(ix + 28, iy);
+      ctx.moveTo(ix + 7, iy + 8); ctx.lineTo(ix + 7, iy - 8);
+      ctx.stroke();
+      arrow(ix + 7, iy + 7, ix + 25, iy - 6, { color: col, lw: 1.6, headL: 6, headW: 5 });
+      ctx.lineWidth = 2.4; ctx.setLineDash([3, 2]);
+      ctx.beginPath(); ctx.moveTo(ix + 8, iy); ctx.lineTo(ix + 24, iy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(ix + 7, iy - 1); ctx.lineTo(ix + 7, iy - 6); ctx.stroke();
+      ctx.restore();
+    };
+    function addModeBtn(x, y, w, h, key, label, icon) {
+      addW({
+        x, y, w, h, cursor: 'pointer',
+        onDown() { S.comps = key; },
+        draw(hov) {
+          const on = S.comps === key;
+          rr(x, y, w, h, 6);
+          ctx.fillStyle = on ? COL.accent : (hov ? '#eef3fb' : '#ffffff'); ctx.fill();
+          ctx.strokeStyle = on || hov ? COL.accent : '#b7c3d4';
+          ctx.lineWidth = on ? 1.5 : 1.2; ctx.stroke();
+          icon(x + 8, y + h / 2, on ? '#ffffff' : COL.accent);
+          ctx.fillStyle = on ? '#ffffff' : COL.text;
+          ctx.font = '13px Segoe UI, system-ui, sans-serif';
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.fillText(label, x + 44, y + h / 2 + 0.5);
+        }
+      });
+    }
+    function addSegPair(x, y, w, h, a, b, get, set) {
+      addW({
+        x, y, w, h, cursor: 'pointer',
+        onDown(p) { set(p.x < x + w / 2 ? a.val : b.val); },
+        draw(hov) {
+          rr(x, y, w, h, 6);
+          ctx.fillStyle = '#ffffff'; ctx.fill();
+          const cur = get();
+          ctx.save(); rr(x, y, w, h, 6); ctx.clip();
+          ctx.fillStyle = COL.accent;
+          if (cur === a.val) ctx.fillRect(x, y, w / 2, h);
+          if (cur === b.val) ctx.fillRect(x + w / 2, y, w / 2, h);
+          ctx.restore();
+          rr(x, y, w, h, 6);
+          ctx.strokeStyle = hov ? COL.accent : '#b7c3d4';
+          ctx.lineWidth = 1.2; ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(x + w / 2, y + 2); ctx.lineTo(x + w / 2, y + h - 2);
+          ctx.strokeStyle = '#cfd9e6'; ctx.lineWidth = 1; ctx.stroke();
+          ctx.font = '12px Segoe UI, system-ui, sans-serif';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillStyle = cur === a.val ? '#ffffff' : COL.text;
+          ctx.fillText(a.label, x + w / 4, y + h / 2 + 0.5);
+          ctx.fillStyle = cur === b.val ? '#ffffff' : COL.text;
+          ctx.fillText(b.label, x + 3 * w / 4, y + h / 2 + 0.5);
+        }
+      });
+    }
+    function addBtn(x, y, w, h, label, onClick, enabled) {
+      addW({
+        x, y, w, h, cursor: 'pointer',
+        onDown() { if (!enabled || enabled()) onClick(); },
+        draw(hov) {
+          const en = !enabled || enabled();
+          rr(x, y, w, h, 7);
+          ctx.fillStyle = en ? (hov ? '#eef3fb' : '#ffffff') : '#f3f5f8'; ctx.fill();
+          ctx.strokeStyle = en ? (hov && COL.accent || '#b7c3d4') : '#dbe1ea';
+          if (en && hov) ctx.strokeStyle = COL.accent;
+          ctx.lineWidth = 1.3; ctx.stroke();
+          ctx.fillStyle = en ? COL.text : '#b3bdca';
+          ctx.font = '600 13px Segoe UI, system-ui, sans-serif';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(label, x + w / 2, y + h / 2 + 0.5);
+        }
+      });
+    }
+    function addSlot(x, y, w, h, v) {
+      addW({
+        x, y, w, h,
+        cursorFn() { return v.placed ? 'default' : 'grab'; },
+        onDown(p) {
+          if (v.placed || drag) return;
+          v.c = { ...v.def };
+          const wpt = toWorld(p);
+          v.tail = { x: wpt.x - v.c.x / 2, y: wpt.y - v.c.y / 2 };
+          drag = { kind: 'new', v };
+          selected = v.id;
+        },
+        draw(hov) {
+          rr(x, y, w, h, 6);
+          if (v.placed) {
+            ctx.setLineDash([4, 3]);
+            ctx.strokeStyle = '#ccd6e2'; ctx.lineWidth = 1.2; ctx.stroke();
+            ctx.setLineDash([]);
+            vecLetter(v.id, x + 12, y + h / 2 + 5, 14, '#c2cddb');
+            ctx.fillStyle = '#c2cddb';
+            ctx.font = '11px Segoe UI, system-ui, sans-serif';
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+            ctx.fillText('on grid', x + 34, y + h / 2 + 1);
+          } else {
+            ctx.fillStyle = hov ? '#f2f7ff' : '#fbfcfe'; ctx.fill();
+            ctx.strokeStyle = hov ? COL.accent : '#c4cfdd';
+            ctx.lineWidth = 1.2; ctx.stroke();
+            arrow(x + 12, y + h - 9, x + 60, y + 9, { color: v.color, lw: 3.5, headL: 10, headW: 8 });
+            vecLetter(v.id, x + w - 34, y + h / 2 + 5, 16, v.color);
+          }
+        }
+      });
+    }
+
+    (function buildUI() {
+      const ip = 12;
+      // Show panel rows
+      addCheckbox(PX + ip, 18, PW - 2 * ip, 25,
+        () => S.sum,
+        v => { S.sum = v; if (!v && selected === 's') selected = null; },
+        sumLabel);
+      addCheckbox(PX + ip, 43, PW - 2 * ip, 25, () => S.values, v => S.values = v, textLabel('Values'));
+      addCheckbox(PX + ip, 68, PW - 2 * ip, 25, () => S.angles, v => S.angles = v, angleLabel);
+      addCheckbox(PX + ip, 93, PW - 2 * ip, 25, () => S.grid, v => S.grid = v, textLabel('Grid'));
+      // Components display mode
+      addModeBtn(PX + ip, 164, PW - 2 * ip, 26, 'none', 'None', icNone);
+      addModeBtn(PX + ip, 195, PW - 2 * ip, 26, 'triangle', 'Triangle', icTri);
+      addModeBtn(PX + ip, 226, PW - 2 * ip, 26, 'axes', 'On axes', icAxes);
+      // Angle convention + snap mode
+      addSegPair(PX + 62, 270, 114, 26,
+        { val: false, label: '±180°' }, { val: true, label: '0–360°' },
+        () => S.deg360, v => S.deg360 = v);
+      addSegPair(PX + 62, 304, 114, 26,
+        { val: false, label: 'Grid' }, { val: true, label: 'Polar' },
+        () => S.polar, v => S.polar = v);
+      addBtn(PX + ip, 348, PW - 2 * ip, 32, 'Arrange tip-to-tail',
+        arrangeTipToTail, () => placedVecs().length >= 2 && !anim);
+      // Vector tray
+      vectors.forEach((v, i) => addSlot(PX + 8, trayBox.y + 24 + i * 40, PW - 16, 36, v));
+      addBtn(PX, 542, 90, 30, 'Erase', eraseAll);
+      addBtn(PX + 98, 542, 90, 30, '↺ Reset', init);
+    })();
+
+    function drawPanels() {
+      panelBox(PX, 8, PW, 120);
+      panelBox(PX, 136, PW, 118);
+      ctx.fillStyle = COL.muted;
+      ctx.font = '600 11px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('COMPONENTS', PX + 12, 156);
+      panelBox(PX, 262, PW, 78);
+      ctx.fillStyle = COL.text;
+      ctx.font = '13px Segoe UI, system-ui, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Angle:', PX + 12, 283);
+      ctx.fillText('Snap:', PX + 12, 317);
+      panelBox(trayBox.x, trayBox.y, trayBox.w, trayBox.h);
+      ctx.fillStyle = COL.muted;
+      ctx.font = '600 11px Segoe UI, system-ui, sans-serif';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('VECTORS — DRAG ONTO GRID', PX + 12, trayBox.y + 17);
+      if (drag && drag.kind === 'move' && inRect(mouse, trayBox)) {
+        rr(trayBox.x, trayBox.y, trayBox.w, trayBox.h, 8);
+        ctx.strokeStyle = '#e05c5c'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = '#e05c5c';
+        ctx.font = '600 11px Segoe UI, system-ui, sans-serif';
+        ctx.fillText('DROP TO REMOVE', PX + 110, trayBox.y + 17);
+      }
+    }
+
+    function drawHints() {
+      ctx.fillStyle = COL.muted;
+      ctx.font = '12px Segoe UI, system-ui, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('Drag the arrow body to move a vector — drag its tip to rotate or stretch it.',
+        GP.x + GP.w / 2, 560);
+      ctx.fillText('Drop a vector back on the tray to remove it.', GP.x + GP.w / 2, 578);
+      if (placedVecs().length === 0 && (!drag || drag.kind !== 'new')) {
+        ctx.fillStyle = '#a9b7c8';
+        ctx.font = '15px Segoe UI, system-ui, sans-serif';
+        ctx.fillText('Drag a vector from the tray onto the grid →', GP.x + GP.w / 2, GP.y + 40);
+      }
+    }
+
+    // ── Main draw ────────────────────────────────────────────
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = COL.bg; ctx.fillRect(0, 0, W, H);
+      drawBar();
+      rr(GP.x, GP.y, GP.w, GP.h, 6);
+      ctx.fillStyle = '#ffffff'; ctx.fill();
+      ctx.save();
+      rr(GP.x, GP.y, GP.w, GP.h, 6); ctx.clip();
+      drawGridLines();
+      sceneVectors();
+      ctx.restore();
+      rr(GP.x, GP.y, GP.w, GP.h, 6);
+      ctx.strokeStyle = COL.border; ctx.lineWidth = 1; ctx.stroke();
+      drawHints();
+      drawPanels();
+      for (const w of widgets) w.draw(w === hoverW && !drag);
+      if (drag && drag.kind === 'new') drawVector(drag.v, true);
+    }
+
+    // ── Interaction ──────────────────────────────────────────
+    function evtPos(e) {
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    function segDist(p, v) {
+      const x1 = sx(v.tail.x), y1 = sy(v.tail.y);
+      const x2 = sx(v.tail.x + v.c.x), y2 = sy(v.tail.y + v.c.y);
+      const dx = x2 - x1, dy = y2 - y1, L2 = dx * dx + dy * dy;
+      if (L2 === 0) return Math.hypot(p.x - x1, p.y - y1);
+      const t = clamp(((p.x - x1) * dx + (p.y - y1) * dy) / L2, 0, 1);
+      return Math.hypot(p.x - (x1 + t * dx), p.y - (y1 + t * dy));
+    }
+    function hitOrder() {
+      const sel = vectors.find(v => v.id === selected && v.placed);
+      const rest = vectors.filter(v => v.placed && v !== sel).reverse();
+      return sel ? [sel, ...rest] : rest;
+    }
+    function updateHover(p) {
+      hoverW = null;
+      for (const w of widgets) {
+        if (inRect(p, w)) {
+          hoverW = w;
+          canvas.style.cursor = w.cursorFn ? w.cursorFn() : (w.cursor || 'pointer');
+          return;
+        }
+      }
+      for (const v of hitOrder()) {
+        const x2 = sx(v.tail.x + v.c.x), y2 = sy(v.tail.y + v.c.y);
+        if (Math.hypot(p.x - x2, p.y - y2) <= 12) { canvas.style.cursor = 'crosshair'; return; }
+      }
+      for (const v of hitOrder()) {
+        if (segDist(p, v) <= 9) { canvas.style.cursor = 'grab'; return; }
+      }
+      if (sumVisible()) {
+        const s = sumC();
+        if (Math.hypot(s.x, s.y) > 0.005
+            ? segDist(p, { tail: { x: 0, y: 0 }, c: s }) <= 9
+            : Math.hypot(p.x - sx(0), p.y - sy(0)) <= 12) {
+          canvas.style.cursor = 'pointer'; return;
+        }
+      }
+      canvas.style.cursor = 'default';
+    }
+
+    canvas.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      canvas.setPointerCapture(e.pointerId);
+      const p = evtPos(e); mouse = p;
+      finishAnim();
+      for (const w of widgets) {
+        if (inRect(p, w)) { if (w.onDown) w.onDown(p); return; }
+      }
+      const hits = hitOrder();
+      for (const v of hits) {
+        const x2 = sx(v.tail.x + v.c.x), y2 = sy(v.tail.y + v.c.y);
+        if (Math.hypot(p.x - x2, p.y - y2) <= 12) {
+          selected = v.id;
+          drag = { kind: 'tip', v };
+          return;
+        }
+      }
+      for (const v of hits) {
+        if (segDist(p, v) <= 9) {
+          selected = v.id;
+          const wpt = toWorld(p);
+          drag = { kind: 'move', v, off: { x: wpt.x - v.tail.x, y: wpt.y - v.tail.y } };
+          return;
+        }
+      }
+      if (sumVisible()) {
+        const s = sumC();
+        const hit = Math.hypot(s.x, s.y) > 0.005
+          ? segDist(p, { tail: { x: 0, y: 0 }, c: s }) <= 9
+          : Math.hypot(p.x - sx(0), p.y - sy(0)) <= 12;
+        if (hit) { selected = 's'; return; }
+      }
+      if (inRect(p, GP)) selected = null;
+    });
+
+    canvas.addEventListener('pointermove', e => {
+      const p = evtPos(e); mouse = p;
+      if (drag) {
+        const wpt = toWorld(p);
+        const v = drag.v;
+        if (drag.kind === 'tip') {
+          snapTip(v, wpt);
+        } else if (drag.kind === 'move') {
+          v.tail = clampTail({ x: wpt.x - drag.off.x, y: wpt.y - drag.off.y }, v.c);
+        } else { // 'new' — held by the arrow's midpoint
+          const raw = { x: wpt.x - v.c.x / 2, y: wpt.y - v.c.y / 2 };
+          v.tail = inRect(p, GP) ? clampTail(raw, v.c) : raw;
+        }
+        canvas.style.cursor = 'grabbing';
+        return;
+      }
+      updateHover(p);
+    });
+
+    function endDrag(p, cancel) {
+      if (!drag) return;
+      const v = drag.v;
+      if (drag.kind === 'new') {
+        if (!cancel && inRect(p, GP)) {
+          v.tail = clampTail(v.tail, v.c);
+          v.placed = true;
+          selected = v.id;
+        } else if (selected === v.id) {
+          selected = null;
+        }
+      } else if (drag.kind === 'move') {
+        if (!cancel && inRect(p, trayBox)) {
+          v.placed = false;
+          if (selected === v.id) selected = null;
+        }
+      }
+      drag = null;
+      updateHover(p);
+    }
+    canvas.addEventListener('pointerup', e => endDrag(evtPos(e), false));
+    canvas.addEventListener('pointercancel', e => endDrag(evtPos(e), true));
+
+    // ── Animation loop ───────────────────────────────────────
+    let lastTs = null;
+    function frame(ts) {
+      if (lastTs === null) lastTs = ts;
+      const dt = Math.min((ts - lastTs) / 1000, 0.05);
+      lastTs = ts;
+      if (anim) {
+        anim.t += dt;
+        const k = Math.min(1, anim.t / anim.dur);
+        const ease = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+        for (const it of anim.items) {
+          it.v.tail = {
+            x: it.from.x + (it.to.x - it.from.x) * ease,
+            y: it.from.y + (it.to.y - it.from.y) * ease
+          };
+        }
+        if (k >= 1) finishAnim();
+      }
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    init();
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
