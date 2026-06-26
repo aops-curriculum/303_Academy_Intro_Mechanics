@@ -10,16 +10,17 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; overflow: hidden; }
     body {
-      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       background: #f4f6fa;
       font-family: 'Segoe UI', system-ui, sans-serif;
       user-select: none; -webkit-user-select: none;
     }
     canvas {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
+      aspect-ratio: 4 / 3;
+      height: min(100%, 75vw);
+      width: auto;
       display: block;
       touch-action: none;
     }
